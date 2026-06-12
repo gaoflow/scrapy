@@ -119,7 +119,12 @@ class FTPDownloadHandler(BaseDownloadHandler):
                 httpcode = self.CODE_MAPPING.get(ftpcode, self.CODE_MAPPING["default"])
                 return Response(url=request.url, status=httpcode, body=message.encode())
             raise
-        protocol.close()
+        finally:
+            # Always release the response buffer and the control connection,
+            # including on the CommandFailed/error paths above.
+            protocol.close()
+            if client.transport is not None:
+                client.transport.loseConnection()
         headers = {"local filename": protocol.filename or b"", "size": protocol.size}
         body = protocol.filename or protocol.body.read()
         respcls = responsetypes.from_args(url=request.url, body=body)

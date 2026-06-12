@@ -6,13 +6,15 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from tempfile import mkstemp
 from typing import TYPE_CHECKING, Any
+from unittest.mock import patch
 
 import pytest
 from pytest_twisted import async_yield_fixture
 from twisted.cred import checkers, credentials, portal
+from twisted.internet.protocol import ClientCreator
 
 from scrapy import Spider
-from scrapy.core.downloader.handlers.ftp import FTPDownloadHandler
+from scrapy.core.downloader.handlers.ftp import FTPDownloadHandler, ReceivedDataProtocol
 from scrapy.crawler import Crawler
 from scrapy.exceptions import NotConfigured
 from scrapy.http import HtmlResponse, Request, Response
@@ -23,7 +25,7 @@ from scrapy.utils.python import to_bytes
 from scrapy.utils.test import get_crawler
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, Generator
+    from collections.abc import AsyncGenerator
 
     from twisted.protocols.ftp import FTPFactory
 
@@ -65,16 +67,28 @@ class TestFTPBase(ABC):
 
     @staticmethod
     @pytest.fixture
-    def dh() -> Generator[FTPDownloadHandler]:
+    def dh() -> FTPDownloadHandler:
         crawler = get_crawler()
-        dh = build_from_crawler(FTPDownloadHandler, crawler)
+        return build_from_crawler(FTPDownloadHandler, crawler)
 
-        yield dh
+    @staticmethod
+    async def _download_with_client(
+        dh: FTPDownloadHandler,
+        request: Request,
+    ):
+        clients = []
+        original_connect_tcp = ClientCreator.connectTCP
 
-        # if the test was skipped, there will be no client attribute
-        if hasattr(dh, "client"):
-            assert dh.client.transport
-            dh.client.transport.loseConnection()
+        def connect_tcp(creator, *args, **kwargs):
+            deferred = original_connect_tcp(creator, *args, **kwargs)
+            deferred.addCallback(lambda client: clients.append(client) or client)
+            return deferred
+
+        with patch.object(ClientCreator, "connectTCP", connect_tcp):
+            response = await dh.download_request(request)
+
+        assert len(clients) == 1
+        return response, clients[0]
 
     @deferred_f_from_coro_f
     async def test_ftp_download_success(
@@ -108,6 +122,38 @@ class TestFTPBase(ABC):
         r = await dh.download_request(request)
         assert r.status == 404
         assert r.body == b"['550 nonexistent.txt: No such file or directory.']"
+
+    @deferred_f_from_coro_f
+    async def test_ftp_download_closes_connection(
+        self, server_url: str, dh: FTPDownloadHandler
+    ) -> None:
+        request = Request(url=server_url + "file.txt", meta=self.req_meta)
+        _, client = await self._download_with_client(dh, request)
+        # The control connection is released rather than left for the GC.
+        assert client.transport is not None
+        assert client.transport.disconnecting
+
+    @deferred_f_from_coro_f
+    async def test_ftp_download_closes_connection_on_error(
+        self, server_url: str, dh: FTPDownloadHandler
+    ) -> None:
+        request = Request(url=server_url + "nonexistent.txt", meta=self.req_meta)
+        r, client = await self._download_with_client(dh, request)
+        assert r.status == 404
+        # The connection is released on the error path too.
+        assert client.transport is not None
+        assert client.transport.disconnecting
+
+    @deferred_f_from_coro_f
+    async def test_ftp_download_closes_protocol_on_error(
+        self, server_url: str, dh: FTPDownloadHandler
+    ) -> None:
+        request = Request(url=server_url + "nonexistent.txt", meta=self.req_meta)
+        with patch.object(ReceivedDataProtocol, "close", autospec=True) as mock_close:
+            r = await dh.download_request(request)
+        assert r.status == 404
+        # The response buffer is closed even when the download fails.
+        mock_close.assert_called_once()
 
     @deferred_f_from_coro_f
     async def test_ftp_local_filename(
